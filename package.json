@@ -1,0 +1,14 @@
+{
+  "name": "three-cooks",
+  "version": "0.1.0",
+  "description": "A 3-player co-op cooking game where each cook is missing one sense and must guide the others.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
