@@ -1,7 +1,13 @@
 import { Kitchen3D } from './scene.js';
+import * as sfx from './sfx.js';
 
 /* global io */
 const socket = io();
+
+// Unlock WebAudio on the first user gesture (browsers require it).
+let audioUnlocked = false;
+function unlockAudio() { if (audioUnlocked) return; audioUnlocked = true; sfx.resume(); }
+document.addEventListener('pointerdown', unlockAudio);
 
 // Stable identity so a dropped/suspended socket (phones background tabs!) can
 // transparently rejoin its room and keep its role.
@@ -87,18 +93,20 @@ socket.on('event', (ev) => {
       if (v) { v.classList.add('pulse'); setTimeout(() => v.classList.remove('pulse'), 1000); }
     }
   } else if (ev.kind === 'gesture') {
-    ui.gestures.unshift({ token: ev.token, t: ev.t });
+    // A "jN" token means the Mute cook pointed at jar N — light it up in 3D.
+    if (ev.token && ev.token[0] === 'j' && ui.kitchen) {
+      const pos = Number(ev.token.slice(1));
+      ui.kitchen.highlightJar(pos);
+      ui.gestures.unshift({ token: '👉 ' + pos, t: ev.t });
+    } else {
+      ui.gestures.unshift({ token: ev.token, t: ev.t });
+    }
     ui.gestures = ui.gestures.slice(0, 6);
     render();
   } else if (ev.kind === 'result') {
     toast(ev.note, ev.ok ? 'good' : 'bad');
-    if (myRole === 'blind') say(ev.ok ? 'Good.' : 'Wrong.');
-    const k = ui.kitchen;
-    if (k) {
-      k.reach('blind');
-      if (ev.ok) { k.react('mute', 'happy'); k.react('deaf', 'happy'); setTimeout(() => k.react('blind', 'happy'), 260); }
-      else { k.react('blind', 'oops'); }
-    }
+    if (myRole === 'blind') say(ev.ok ? 'Good.' : 'Wrong!');
+    if (ui.kitchen) ui.kitchen.onResult(ev);
   }
 });
 
@@ -110,14 +118,53 @@ function emitVoice() {
   ui.log.unshift({ who: 'You', text, heard: false }); ui.log = ui.log.slice(0, 12);
   input.value = ''; render();
 }
-function sendGesture(token) { socket.emit('gesture', { token }); toast('Signalled ' + token); }
-function doAction(action) { socket.emit('action', action); }
+function sendGesture(token) { sfx.play('click'); socket.emit('gesture', { token }); toast('Signalled ' + token); }
+function doAction(action) { sfx.play('click'); socket.emit('action', action); }
+
+// ---------------------------------------------------------------- microphone
+// Deaf & Blind "speak" by talking into the mic; it's transcribed and sent on the
+// voice channel (so it still obeys the sense rules — the server routes it).
+const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recog = null, recogText = '';
+function micSupported() { return !!SpeechRec; }
+function toggleMic() {
+  if (!SpeechRec) { toast('No mic support here — type instead', 'bad'); return; }
+  if (ui.listening) { try { recog.stop(); } catch {} return; }
+  recog = new SpeechRec();
+  recog.lang = 'en-US'; recog.interimResults = true; recog.continuous = false;
+  recogText = '';
+  recog.onresult = (e) => {
+    let interim = '', final = '';
+    for (let i = 0; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) final += r[0].transcript; else interim += r[0].transcript;
+    }
+    recogText = (final || interim).trim();
+    const el = document.getElementById('micLive'); if (el) el.textContent = recogText || '…';
+  };
+  recog.onerror = (e) => { ui.listening = false; if (e.error === 'not-allowed') toast('Mic blocked — allow access', 'bad'); render(); };
+  recog.onend = () => {
+    ui.listening = false;
+    const t = recogText.trim();
+    if (t) { socket.emit('voice', { text: t }); ui.log.unshift({ who: 'You', text: t, heard: false }); ui.log = ui.log.slice(0, 12); }
+    recogText = ''; render();
+  };
+  try { recog.start(); ui.listening = true; render(); } catch { ui.listening = false; }
+}
+
+// The Mute cook points by tapping a jar in the 3D scene.
+function onStagePick(e) {
+  if (ui.state?.role !== 'mute' || !ui.kitchen) return;
+  const pos = ui.kitchen.pickJarAt(e.clientX, e.clientY);
+  if (pos) { sfx.play('click'); socket.emit('gesture', { token: 'j' + pos }); ui.kitchen.highlightJar(pos); toast('Pointing at jar ' + pos); }
+}
 
 // ---------------------------------------------------------------- layers / 3D
 function ensureKitchen() {
   if (ui.kitchen) return ui.kitchen;
   ui.kitchen = new Kitchen3D(stage);
   ui.kitchen.mount();
+  stage.addEventListener('pointerdown', onStagePick);
   return ui.kitchen;
 }
 function showLayer(mode, role) {
@@ -129,12 +176,7 @@ function showLayer(mode, role) {
 function applyKitchen(v) {
   const k = ensureKitchen();
   if (ui.role3d !== v.role) { k.setRole(v.role); ui.role3d = v.role; }
-  if (v.stepIndex < ui.prevStep) k.clearPot();         // new game started
-  if (v.role === 'deaf' && v.steps) {
-    for (let i = ui.prevStep; i < v.stepIndex; i++) {
-      if ((v.steps[i]?.text || '').startsWith('Add')) k.addGenericBlob();
-    }
-  }
+  if (v.stepIndex < ui.prevStep || v.stepIndex === 0) k.clearPot(); // new game
   ui.prevStep = v.stepIndex;
   k.update(v);
   requestAnimationFrame(() => k.resize());
@@ -209,6 +251,14 @@ function renderLobby() {
 function voiceComposer(placeholder) {
   return `<div class="composer"><input id="voiceInput" type="text" maxlength="140" placeholder="${placeholder}" autocomplete="off" /><button class="primary" data-act="voice">Say</button></div>`;
 }
+function micComposer(placeholder) {
+  const btn = micSupported()
+    ? `<button class="mic-btn ${ui.listening ? 'live' : ''}" data-act="mic">${ui.listening ? '🔴 Listening… tap to send' : '🎤 Tap &amp; talk'}</button>
+       ${ui.listening ? `<div class="mic-live" id="micLive">…</div>` : ''}`
+    : `<p class="hint">🎤 Mic isn't supported in this browser — type instead.</p>`;
+  return `<div class="speak">${btn}
+    <details class="type-fallback"${micSupported() ? '' : ' open'}><summary>type instead</summary>${voiceComposer(placeholder)}</details></div>`;
+}
 function logBlock(title, big) {
   const items = ui.log.length
     ? ui.log.map((m) => `<div class="msg ${m.heard ? 'heard' : ''} ${big ? 'big' : ''}"><div class="who">${esc(m.who)}</div>${esc(m.text)}</div>`).join('')
@@ -248,24 +298,23 @@ function renderDeafHUD(v) {
       <div class="callout">👉 ${esc(v.currentInstruction)}</div>
       <div class="card"><h3>Signals from 🙊 Mute</h3><div class="gest-in">${gest}</div></div>
       <div class="card"><h3>Recipe</h3><ul class="steps">${steps}</ul></div>
-      <div class="card"><h3>Speak <small class="muted">(Blind &amp; Mute hear you)</small></h3>${voiceComposer('Tell the Blind cook what to do…')}</div>
+      <div class="card"><h3>🎤 Talk <small class="muted">(Blind &amp; Mute hear you)</small></h3>${micComposer('Tell the Blind cook what to do…')}</div>
     </div></div>`;
 }
 
 function renderMuteHUD(v) {
-  const nums = [1,2,3,4,5,6,7,8,9].map((n) => `<button data-act="gesture" data-token="${n}">${n}</button>`).join('');
   hud.innerHTML = `<div class="hud-inner">
     ${hudTop(v)}
     <div class="viewport-spacer"></div>
     <div class="sheet stack">
-      <div class="hint-badge">🙊 You see the kitchen in 3D — jar numbers &amp; the pot. Signal 🙉, you can't speak.</div>
-      <div class="card"><h3>Signal the 🙉 Deaf cook</h3>
-        <div class="gest-pad">${nums}</div>
+      <div class="hint-badge">🙊 Tap a jar up in the kitchen to point at it — the 🙉 Deaf cook sees it light up.</div>
+      <div class="card"><h3>Point &amp; react</h3>
+        <p class="hint" style="margin:0 0 10px">👆 Tap any jar in the 3D kitchen above to show the Deaf cook where it is. Use these to react:</p>
         <div class="gest-wide">
-          <button data-act="gesture" data-token="✅">✅</button>
-          <button data-act="gesture" data-token="❌">❌</button>
-          <button data-act="gesture" data-token="🔼">🔼</button>
-          <button data-act="gesture" data-token="🔽">🔽</button>
+          <button data-act="gesture" data-token="✅">✅ Yes</button>
+          <button data-act="gesture" data-token="❌">❌ No</button>
+          <button data-act="gesture" data-token="🔼">🔼 More</button>
+          <button data-act="gesture" data-token="🔽">🔽 Less</button>
         </div></div>
       ${logBlock('👂 What you hear', false)}
     </div></div>`;
@@ -289,7 +338,7 @@ function renderBlindHUD(v) {
         <button class="full" data-act="stir">🥄 Stir</button>
         <div class="heat-row">${heat}</div>
         <button class="full ${v.canServe ? 'primary' : ''}" data-act="serve">🍽️ Serve</button></div>
-      <div class="card"><h3>Speak <small class="muted">(only Mute hears you)</small></h3>${voiceComposer('Ask something out loud…')}</div>
+      <div class="card"><h3>🎤 Talk <small class="muted">(only Mute hears you)</small></h3>${micComposer('Ask something out loud…')}</div>
     </div></div>`;
 }
 
@@ -323,6 +372,7 @@ document.addEventListener('click', (e) => {
   } else if (act === 'role') { socket.emit('pickRole', { role: btn.dataset.role }); }
   else if (act === 'start') { socket.emit('start', { recipeId: btn.dataset.recipe }); }
   else if (act === 'voice') { emitVoice(); }
+  else if (act === 'mic') { unlockAudio(); toggleMic(); }
   else if (act === 'gesture') { sendGesture(btn.dataset.token); }
   else if (act === 'grab') { doAction({ kind: 'grab', pos: Number(btn.dataset.pos) }); }
   else if (act === 'stir') { doAction({ kind: 'stir' }); }

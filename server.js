@@ -147,7 +147,7 @@ function checkAction(room, action) {
     if (!slot) return { ok: false, reason: 'Empty spot.' };
     if (slot.ingredient !== step.ingredient) return { ok: false, reason: `Wrong jar — that was ${INGREDIENTS[slot.ingredient].label}.` };
     s.pot.push(slot.ingredient); s.stepIndex++;
-    return { ok: true, note: `Added ${INGREDIENTS[slot.ingredient].label}.` };
+    return { ok: true, note: `Added ${INGREDIENTS[slot.ingredient].label}.`, ingredient: slot.ingredient };
   }
   if (action.kind === 'stir') {
     if (step.type !== 'stir') return { ok: false, reason: 'No need to stir right now.' };
@@ -277,12 +277,13 @@ io.on('connection', (socket) => {
     const { r, me } = meOf(socket);
     if (!r || r.phase !== 'playing' || !me || me.role !== 'blind') return;
     const result = checkAction(r, action);
+    const act = { kind: action.kind, pos: action.pos, level: action.level, ingredient: result.ingredient };
     if (result.ok) {
-      perceive(r, { audio: true, visual: true, payload: { kind: 'result', ok: true, note: result.note } });
+      perceive(r, { audio: true, visual: true, payload: { kind: 'result', ok: true, note: result.note, act } });
       if (r.state.stepIndex >= r.recipe.steps.length) { r.phase = 'won'; r.state.finishedAt = Date.now(); }
     } else {
       r.state.mistakes++;
-      perceive(r, { audio: true, visual: true, payload: { kind: 'result', ok: false, note: result.reason } });
+      perceive(r, { audio: true, visual: true, payload: { kind: 'result', ok: false, note: result.reason, act } });
     }
     broadcastState(r);
   });
