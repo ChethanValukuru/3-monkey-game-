@@ -19,7 +19,47 @@ body {
   font-family: ui-rounded, "Segoe UI", system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
-#app { max-width: 560px; margin: 0 auto; padding: 16px; min-height: 100%; }
+/* Layers: 3D canvas (back) < HUD overlay < app screens (home/lobby/won) */
+#stage { position: fixed; inset: 0; width: 100vw; height: 100vh; display: none; z-index: 0; }
+#blindfold { display: none; }
+#app { position: relative; z-index: 5; max-width: 560px; margin: 0 auto; padding: 16px; min-height: 100%; }
+
+#hud { position: fixed; inset: 0; z-index: 2; display: none; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+#hud .hud-inner { min-height: 100%; display: flex; flex-direction: column; max-width: 560px; margin: 0 auto; }
+#hud .topbar {
+  position: sticky; top: 0; z-index: 3; display: flex; gap: 8px; align-items: center;
+  padding: 10px 14px calc(10px + env(safe-area-inset-top));
+  background: linear-gradient(180deg, rgba(21,17,14,.92), rgba(21,17,14,0));
+  pointer-events: none;
+}
+#hud .topbar .stat { pointer-events: auto; }
+#hud .viewport-spacer { flex: 1 1 auto; min-height: 34vh; pointer-events: none; }
+#hud .sheet {
+  background: linear-gradient(180deg, rgba(21,17,14,0) 0%, rgba(21,17,14,.8) 12%, rgba(21,17,14,.97) 30%);
+  padding: 30px 14px calc(18px + env(safe-area-inset-bottom)); margin-top: auto;
+}
+#hud .sheet > * { pointer-events: auto; }
+#hud .card { background: rgba(36,28,22,.94); backdrop-filter: blur(3px); }
+#hud .hint-badge {
+  display: inline-block; background: rgba(0,0,0,.45); color: var(--muted);
+  padding: 6px 12px; border-radius: 999px; font-size: .78rem; margin: 0 auto 10px; pointer-events: auto;
+}
+
+/* Blind cook's dark viewport (the canvas is hidden for them) */
+#hud .blind-void {
+  flex: 1 1 auto; min-height: 42vh; position: relative;
+  background: radial-gradient(circle at 50% 40%, #12100c, #000 72%);
+  display: flex; align-items: center; justify-content: center; text-align: center; color: #cdd3e0;
+  overflow: hidden;
+}
+#hud .blind-void .ring {
+  position: absolute; left: 50%; top: 40%; transform: translate(-50%, -50%);
+  border: 2px solid rgba(255,145,77,.5); border-radius: 50%; animation: ripple 2.6s ease-out infinite;
+}
+#hud .blind-void .ring:nth-child(2) { animation-delay: 1.3s; }
+@keyframes ripple { 0% { width: 24px; height: 24px; opacity: .8; } 100% { width: 340px; height: 340px; opacity: 0; } }
+#hud .blind-void .bf-heard { position: relative; z-index: 2; padding: 0 28px; font-size: 1.25rem; font-weight: 700; text-shadow: 0 2px 10px #000; }
+#hud .blind-void.pulse .ring { animation-duration: 1s; border-color: var(--accent-2); }
 
 h1, h2, h3 { margin: 0 0 8px; line-height: 1.15; }
 .title { font-size: 2.2rem; letter-spacing: .5px; }
