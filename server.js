@@ -5,6 +5,9 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import { INGREDIENTS, RECIPES, HEAT_LEVELS } from './recipes.js';
+import * as battle from './battle.js';
+
+const MAX_PLAYERS = { cooks: 3, battle: battle.BATTLE_MAX };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -45,9 +48,12 @@ function shuffle(arr) {
   for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
   return a;
 }
-function newRoom(code) {
-  return { code, hostPid: null, players: new Map(), phase: 'lobby', recipe: null, shelf: [], state: null };
+function newRoom(code, game = 'cooks') {
+  return { code, game, hostPid: null, players: new Map(), phase: 'lobby', recipe: null, shelf: [], state: null, battle: null, timer: null };
 }
+function maxFor(room) { return MAX_PLAYERS[room.game] || 3; }
+function connectedPids(room) { return [...room.players.values()].filter((p) => p.connected).map((p) => p.pid); }
+function nameOf(room, pid) { return room.players.get(pid)?.name || '?'; }
 function roleTaken(room, role) { for (const p of room.players.values()) if (p.role === role) return true; return false; }
 function playerByRole(room, role) { for (const p of room.players.values()) if (p.role === role) return p; return null; }
 function liveCount(room) { let n = 0; for (const p of room.players.values()) if (p.connected) n++; return n; }
@@ -123,8 +129,9 @@ function viewFor(room, role) {
 function broadcastState(room) {
   for (const p of room.players.values()) {
     if (!p.connected) continue;
-    const v = viewFor(room, p.role);
-    v.isHost = p.pid === room.hostPid;
+    let v;
+    if (room.game === 'battle') { v = battleViewFor(room, p.pid); }
+    else { v = viewFor(room, p.role); v.game = 'cooks'; v.isHost = p.pid === room.hostPid; }
     io.to(p.sid).emit('state', v);
   }
 }
@@ -171,6 +178,76 @@ function checkAction(room, action) {
   return { ok: false, reason: 'Unknown action.' };
 }
 
+// ---------------------------------------------------------------------------
+// Answer Battle (Quiplash-style) — view + flow control
+// ---------------------------------------------------------------------------
+function battleViewFor(room, pid) {
+  const b = room.battle;
+  const players = [...room.players.values()].map((p) => ({
+    name: p.name, score: b.scores[p.pid] || 0, connected: p.connected, you: p.pid === pid, host: p.pid === room.hostPid,
+  }));
+  const base = { game: 'battle', code: room.code, phase: b.phase, round: b.round, rounds: b.rounds, players, isHost: pid === room.hostPid, deadline: b.deadline || null };
+
+  if (b.phase === 'answer') {
+    const mine = battle.promptsFor(b, pid).map((p) => ({ id: p.id, text: p.text, answer: p.answers[pid] || '' }));
+    let done = 0, total = 0;
+    for (const p of room.players.values()) { if (!p.connected) continue; total++; if (battle.promptsFor(b, p.pid).every((x) => x.answers[p.pid])) done++; }
+    return { ...base, myPrompts: mine, done, total, allMine: mine.length > 0 && mine.every((x) => x.answer) };
+  }
+  if (b.phase === 'vote') {
+    const m = battle.currentMatchup(b);
+    const v = {
+      ...base, matchupNum: b.voteIndex + 1, matchupTotal: b.matchups.length, prompt: m.text,
+      answerA: m.answers[m.authors[0]], answerB: m.answers[m.authors[1]],
+      amAuthor: m.authors.includes(pid), myVote: m.votes[pid] || null, revealed: m.revealed,
+    };
+    let voted = 0, elig = 0;
+    for (const p of room.players.values()) { if (!p.connected || m.authors.includes(p.pid)) continue; elig++; if (m.votes[p.pid]) voted++; }
+    v.voted = voted; v.elig = elig;
+    if (m.revealed) { v.aVotes = m.aVotes; v.bVotes = m.bVotes; v.nameA = nameOf(room, m.authors[0]); v.nameB = nameOf(room, m.authors[1]); v.flawless = m.flawless || null; }
+    return v;
+  }
+  if (b.phase === 'scores' || b.phase === 'final') {
+    const board = players.slice().sort((x, y) => y.score - x.score);
+    return { ...base, board, final: b.phase === 'final' };
+  }
+  return base; // lobby
+}
+
+function setBattleTimer(room, ms, fn) {
+  clearBattleTimer(room);
+  room.battle.deadline = Date.now() + ms;
+  room.timer = setTimeout(() => { room.timer = null; room.battle.deadline = null; fn(); }, ms);
+}
+function clearBattleTimer(room) { if (room.timer) { clearTimeout(room.timer); room.timer = null; } room.battle.deadline = null; }
+
+function battleToVoting(room) {
+  const b = room.battle;
+  if (b.phase !== 'answer') return;
+  battle.fillBlanks(b);
+  b.phase = 'vote';
+  startVoteTimer(room);
+  broadcastState(room);
+}
+function startVoteTimer(room) {
+  // reveal automatically if a slow voter leaves the matchup hanging
+  setBattleTimer(room, 30000, () => { battleReveal(room); });
+}
+function battleReveal(room) {
+  const b = room.battle;
+  const m = battle.currentMatchup(b);
+  if (!m || m.revealed) return;
+  battle.reveal(b);
+  broadcastState(room);
+  setBattleTimer(room, 4500, () => battleAdvance(room));
+}
+function battleAdvance(room) {
+  const b = room.battle;
+  const next = battle.advanceVote(b);
+  if (next === 'vote') { startVoteTimer(room); broadcastState(room); }
+  else { clearBattleTimer(room); broadcastState(room); } // scores
+}
+
 function bindSocket(socket, pid, code) {
   sidPid.set(socket.id, pid);
   pidRoom.set(pid, code);
@@ -204,25 +281,27 @@ io.on('connection', (socket) => {
     if (me) {
       me.sid = socket.id; me.connected = true; if (name) me.name = name;
     } else {
-      if (r.phase !== 'lobby' || r.players.size >= 3) return socket.emit('error_msg', 'Could not rejoin that game.');
+      if (r.phase !== 'lobby' || r.players.size >= maxFor(r)) return socket.emit('error_msg', 'Could not rejoin that game.');
       me = { pid, sid: socket.id, name: (name || 'Cook').slice(0, 16), role: null, connected: true };
       r.players.set(pid, me);
     }
     if (!r.hostPid || !r.players.get(r.hostPid)?.connected) r.hostPid = pid;
     bindSocket(socket, pid, r.code);
-    socket.emit('joined', { code: r.code });
+    socket.emit('joined', { code: r.code, game: r.game });
     broadcastState(r);
   });
 
-  socket.on('create', ({ name, pid }) => {
+  socket.on('create', ({ name, pid, game }) => {
     if (!pid) return;
+    const g = game === 'battle' ? 'battle' : 'cooks';
     const code = makeCode();
-    const r = newRoom(code);
+    const r = newRoom(code, g);
+    if (g === 'battle') r.battle = battle.newBattle();
     r.hostPid = pid;
     r.players.set(pid, { pid, sid: socket.id, name: (name || 'Host').slice(0, 16), role: null, connected: true });
     rooms.set(code, r);
     bindSocket(socket, pid, code);
-    socket.emit('joined', { code });
+    socket.emit('joined', { code, game: g });
     broadcastState(r);
   });
 
@@ -232,19 +311,19 @@ io.on('connection', (socket) => {
     if (!r) return socket.emit('error_msg', 'No kitchen with that code.');
     if (r.players.has(pid)) { // already a member — treat as resume
       const me = r.players.get(pid); me.sid = socket.id; me.connected = true;
-      bindSocket(socket, pid, r.code); socket.emit('joined', { code: r.code }); return broadcastState(r);
+      bindSocket(socket, pid, r.code); socket.emit('joined', { code: r.code, game: r.game }); return broadcastState(r);
     }
     if (r.phase !== 'lobby') return socket.emit('error_msg', 'That game already started.');
-    if (r.players.size >= 3) return socket.emit('error_msg', 'Kitchen is full (3 cooks).');
+    if (r.players.size >= maxFor(r)) return socket.emit('error_msg', r.game === 'battle' ? 'Party is full (15 players).' : 'Kitchen is full (3 cooks).');
     r.players.set(pid, { pid, sid: socket.id, name: (name || 'Cook').slice(0, 16), role: null, connected: true });
     bindSocket(socket, pid, r.code);
-    socket.emit('joined', { code: r.code });
+    socket.emit('joined', { code: r.code, game: r.game });
     broadcastState(r);
   });
 
   socket.on('pickRole', ({ role }) => {
     const { r, me } = meOf(socket);
-    if (!r || r.phase !== 'lobby' || !me || !ROLES.includes(role)) return;
+    if (!r || r.game !== 'cooks' || r.phase !== 'lobby' || !me || !ROLES.includes(role)) return;
     if (role !== me.role && roleTaken(r, role)) return socket.emit('error_msg', 'That role is taken.');
     me.role = me.role === role ? null : role;
     broadcastState(r);
@@ -252,12 +331,51 @@ io.on('connection', (socket) => {
 
   socket.on('start', ({ recipeId }) => {
     const { r, me } = meOf(socket);
-    if (!r || r.phase !== 'lobby' || !me) return;
+    if (!r || r.game !== 'cooks' || r.phase !== 'lobby' || !me) return;
     if (me.pid !== r.hostPid) return socket.emit('error_msg', 'Only the host can start.');
     if (ROLES.some((role) => !roleTaken(r, role))) return socket.emit('error_msg', 'All three roles must be filled.');
     const recipe = RECIPES.find((x) => x.id === recipeId) || RECIPES[0];
     startGame(r, recipe);
     broadcastState(r);
+  });
+
+  // ---- Answer Battle events ----
+  socket.on('bStart', () => {
+    const { r, me } = meOf(socket);
+    if (!r || r.game !== 'battle' || r.battle.phase !== 'lobby' || !me || me.pid !== r.hostPid) return;
+    const pids = connectedPids(r);
+    if (pids.length < battle.BATTLE_MIN) return socket.emit('error_msg', `Need at least ${battle.BATTLE_MIN} players.`);
+    battle.startRound(r.battle, pids);
+    setBattleTimer(r, 100000, () => battleToVoting(r)); // answer time limit
+    broadcastState(r);
+  });
+
+  socket.on('bAnswer', ({ promptId, text }) => {
+    const { r, me } = meOf(socket);
+    if (!r || r.game !== 'battle' || r.battle.phase !== 'answer' || !me) return;
+    battle.submitAnswer(r.battle, me.pid, promptId, text);
+    if (battle.allAnswered(r.battle)) battleToVoting(r);
+    else broadcastState(r);
+  });
+
+  socket.on('bVote', ({ choice }) => {
+    const { r, me } = meOf(socket);
+    if (!r || r.game !== 'battle' || r.battle.phase !== 'vote' || !me) return;
+    if (!battle.submitVote(r.battle, me.pid, choice)) return;
+    if (battle.allVoted(r.battle, connectedPids(r))) battleReveal(r);
+    else broadcastState(r);
+  });
+
+  socket.on('bNext', () => {
+    const { r, me } = meOf(socket);
+    if (!r || r.game !== 'battle' || !me || me.pid !== r.hostPid) return;
+    const b = r.battle;
+    if (b.phase === 'answer') { clearBattleTimer(r); battleToVoting(r); }
+    else if (b.phase === 'vote' && battle.currentMatchup(b)?.revealed) { clearBattleTimer(r); battleAdvance(r); }
+    else if (b.phase === 'scores') {
+      if (battle.isLastRound(b)) { b.phase = 'final'; broadcastState(r); }
+      else { battle.startRound(b, connectedPids(r)); setBattleTimer(r, 100000, () => battleToVoting(r)); broadcastState(r); }
+    }
   });
 
   socket.on('voice', ({ text }) => {
@@ -291,7 +409,8 @@ io.on('connection', (socket) => {
   socket.on('playAgain', () => {
     const { r, me } = meOf(socket);
     if (!r || !me || me.pid !== r.hostPid) return;
-    r.phase = 'lobby'; r.recipe = null; r.state = null; r.shelf = [];
+    if (r.game === 'battle') { clearBattleTimer(r); battle.resetBattle(r.battle); }
+    else { r.phase = 'lobby'; r.recipe = null; r.state = null; r.shelf = []; }
     broadcastState(r);
   });
 
@@ -308,6 +427,12 @@ io.on('connection', (socket) => {
       const alt = [...r.players.values()].find((p) => p.connected);
       if (alt) r.hostPid = alt.pid;
     }
+    // a leaver might have been the last player a battle phase was waiting on
+    if (r.game === 'battle' && r.battle) {
+      const b = r.battle;
+      if (b.phase === 'answer' && battle.allAnswered(b)) battleToVoting(r);
+      else if (b.phase === 'vote' && !battle.currentMatchup(b)?.revealed && battle.allVoted(b, connectedPids(r))) battleReveal(r);
+    }
     broadcastState(r);
     scheduleCleanup(code);
   });
@@ -318,9 +443,9 @@ server.listen(PORT, '0.0.0.0', () => {
   const nets = os.networkInterfaces();
   const lan = [];
   for (const name of Object.keys(nets)) for (const net of nets[name] || []) if (net.family === 'IPv4' && !net.internal) lan.push(net.address);
-  console.log('\n  🍳  Three Cooks is running!\n');
+  console.log('\n  🎮  Party Games is running!  (🍳 Three Cooks + 🎉 Answer Battle)\n');
   console.log(`  On this computer:   http://localhost:${PORT}`);
   for (const ip of lan) console.log(`  On the same Wi-Fi:  http://${ip}:${PORT}`);
-  console.log('\n  Open it on 3 devices (phones work great), create a kitchen on one,');
-  console.log('  and share the 4-letter code with the other two.\n');
+  console.log('\n  Open it on everyone\'s phones (same Wi-Fi), create a game on one,');
+  console.log('  and share the 4-letter code with the group.\n');
 });

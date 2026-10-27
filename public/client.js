@@ -74,13 +74,9 @@ function say(text) {
 }
 
 // ---------------------------------------------------------------- socket
-socket.on('joined', ({ code }) => { ui.code = code; localStorage.setItem('tc_code', code); ui.screen = 'lobby'; render(); });
+socket.on('joined', ({ code, game }) => { ui.code = code; ui.game = game || 'cooks'; localStorage.setItem('tc_code', code); ui.screen = 'room'; render(); });
 socket.on('error_msg', (m) => toast(m, 'bad'));
-socket.on('state', (view) => {
-  ui.state = view;
-  ui.screen = view.phase === 'lobby' ? 'lobby' : view.phase === 'won' ? 'won' : 'game';
-  render();
-});
+socket.on('state', (view) => { ui.state = view; ui.screen = 'room'; render(); });
 socket.on('event', (ev) => {
   const myRole = ui.state?.role;
   if (ev.kind === 'voice') {
@@ -184,11 +180,11 @@ function applyKitchen(v) {
 
 // ---------------------------------------------------------------- render
 function render() {
-  if (ui.screen === 'game' && ui.state?.phase === 'playing') {
+  // Three Cooks in-game uses the 3D stage; everything else renders into #app.
+  if (ui.screen === 'room' && ui.state?.game === 'cooks' && ui.state.phase === 'playing') {
     showLayer('game', ui.state.role);
     applyKitchen(ui.state);
-    // Preserve scroll + any in-progress typing across HUD rebuilds (state/events
-    // arrive constantly, and we must not yank the sheet back to the top).
+    // Preserve scroll + any in-progress typing across HUD rebuilds.
     const sc = hud.scrollTop;
     const active = document.activeElement;
     const typing = active && active.id === 'voiceInput' ? { val: active.value, caret: active.selectionStart } : null;
@@ -201,27 +197,41 @@ function render() {
     return;
   }
   showLayer('app');
-  if (ui.screen === 'home') return renderHome();
-  if (ui.screen === 'lobby') return renderLobby();
-  if (ui.screen === 'won') return renderWon();
+  const a = document.activeElement;
+  const keep = a && a.matches && a.matches('input') ? { id: a.id, val: a.value, caret: a.selectionStart } : null;
+  if (ui.screen !== 'room' || !ui.state) renderHome();
+  else if (ui.state.game === 'battle') renderBattle(ui.state);
+  else if (ui.state.phase === 'won') renderWon();
+  else renderLobby();
+  if (keep && keep.id) { const el = document.getElementById(keep.id); if (el) { try { el.value = keep.val; el.focus(); el.setSelectionRange(keep.caret, keep.caret); } catch {} } }
 }
 
 function renderHome() {
   app.innerHTML = `
     <div class="center">
-      <div class="title">🍳 Three Cooks</div>
-      <p class="sub">One can't see. One can't hear. One can't speak.<br/>Cook the dish together — if you can.</p>
-      ${pixelTrio()}
+      <div class="title">🎮 Party Games</div>
+      <p class="sub">Pick a game — everyone plays on their own phone.</p>
     </div>
     <div class="card stack">
       <div><label>Your name</label><input id="nameInput" type="text" maxlength="16" placeholder="e.g. Alex" value="${esc(ui.name)}" /></div>
-      <button class="primary full" data-act="create">Create a kitchen</button>
+    </div>
+    <div class="game-pick">
+      <button class="game-card" data-act="create" data-game="cooks">
+        <span class="gc-emoji">🍳</span>
+        <span class="gc-meta"><b>Three Cooks</b><small>3 players · blind, deaf &amp; mute cook together</small></span>
+        <span class="gc-go">Host ›</span>
+      </button>
+      <button class="game-card" data-act="create" data-game="battle">
+        <span class="gc-emoji">🎉</span>
+        <span class="gc-meta"><b>Answer Battle</b><small>3–15 players · funniest answer wins</small></span>
+        <span class="gc-go">Host ›</span>
+      </button>
     </div>
     <div class="card stack">
-      <div><label>Join with a code</label><input id="codeInput" class="code" type="text" maxlength="4" placeholder="ABCD" /></div>
-      <button class="full" data-act="join">Join kitchen</button>
+      <div><label>Or join a game with a code</label><input id="codeInput" class="code" type="text" maxlength="4" placeholder="ABCD" /></div>
+      <button class="full" data-act="join">Join game</button>
     </div>
-    <p class="hint center">Best with 3 people on 3 phones on the same Wi-Fi. One person creates the kitchen and shares the 4-letter code.</p>`;
+    <p class="hint center">Everyone on the same Wi-Fi. One person hosts a game and shares the 4-letter code.</p>`;
 }
 
 function roster(view) {
@@ -355,13 +365,121 @@ function renderWon() {
     ${v.isHost ? `<button class="primary full" data-act="again">Back to lobby</button>` : `<p class="hint center">Waiting for the host to restart…</p>`}`;
 }
 
+// ---------------------------------------------------------------- Answer Battle
+let answerDraft = {}, battleRound = -1;
+document.addEventListener('input', (e) => {
+  if (e.target.classList && e.target.classList.contains('ans-input')) answerDraft[e.target.dataset.pid] = e.target.value;
+});
+
+function renderBattle(v) {
+  if (v.round !== battleRound) { answerDraft = {}; battleRound = v.round; }
+  if (v.phase === 'lobby') return renderBattleLobby(v);
+  if (v.phase === 'answer') return renderBattleAnswer(v);
+  if (v.phase === 'vote') return renderBattleVote(v);
+  return renderBattleScores(v); // scores | final
+}
+
+function renderBattleLobby(v) {
+  const list = v.players.map((p) =>
+    `<div class="prow"><span class="pdot ${p.connected ? 'on' : ''}"></span><span class="pn">${esc(p.name)}</span>${p.host ? '<span class="pill">host</span>' : ''}${p.you ? '<span class="pill">you</span>' : ''}</div>`).join('');
+  const n = v.players.length;
+  app.innerHTML = `
+    <div class="center"><div class="title">🎉 Answer Battle</div><p class="sub" style="margin-bottom:6px">Share this code</p><div class="code-badge">${esc(v.code)}</div></div>
+    <div class="card"><h3>Players (${n}/15)</h3><div class="plist">${list}</div></div>
+    ${v.isHost
+      ? `<button class="primary full" data-act="bstart" ${n < 3 ? 'disabled' : ''}>Start game</button>
+         <p class="hint center">${n < 3 ? 'Need at least 3 players to start.' : 'Everyone writes answers, then the group votes on the funniest. Best with 5+!'}</p>`
+      : `<p class="hint center">Waiting for the host to start…</p>`}`;
+}
+
+function renderBattleAnswer(v) {
+  const cards = v.myPrompts.map((p) => {
+    const val = answerDraft[p.id] ?? p.answer ?? '';
+    return `<div class="card"><div class="q-prompt">${esc(p.text)}</div>
+      <input id="ans_${p.id}" class="ans-input" data-pid="${p.id}" type="text" maxlength="100" placeholder="Type something funny…" autocomplete="off" value="${esc(val)}" /></div>`;
+  }).join('');
+  app.innerHTML = `
+    <div class="bhead"><b>Round ${v.round}/${v.rounds}</b><span class="spacer"></span><span class="muted">${v.done}/${v.total} done</span> <span class="cd" id="bcount"></span></div>
+    <h3 class="center" style="margin:4px 0 12px">✍️ Write your answers!</h3>
+    ${cards}
+    ${v.allMine
+      ? `<div class="done-badge">✓ Sent! Waiting for everyone… (${v.done}/${v.total})</div><button class="full" data-act="banswer">Update answers</button>`
+      : `<button class="primary full" data-act="banswer">Submit answers</button>`}`;
+}
+
+function submitBattleAnswers() {
+  const inputs = document.querySelectorAll('.ans-input');
+  let any = false;
+  inputs.forEach((inp) => { const text = inp.value.trim(); if (text) { socket.emit('bAnswer', { promptId: inp.dataset.pid, text }); any = true; } });
+  if (!any) toast('Write at least one answer first', 'bad'); else toast('Sent!', 'good');
+}
+
+function revealCard(label, text, name, votes, flawless, winner) {
+  return `<div class="reveal-card ${winner ? 'win' : ''}">
+    <div class="rc-ans">${esc(text)}</div>
+    <div class="rc-foot"><span class="rc-name">${esc(name)}</span><span class="rc-votes">${votes} ▲${flawless ? ' <b>LASH!</b>' : ''}</span></div></div>`;
+}
+
+function renderBattleVote(v) {
+  const head = `<div class="bhead"><b>Round ${v.round}/${v.rounds}</b><span class="spacer"></span><span class="muted">Matchup ${v.matchupNum}/${v.matchupTotal}</span> <span class="cd" id="bcount"></span></div>`;
+  if (v.revealed) {
+    app.innerHTML = `${head}
+      <div class="q-prompt center">${esc(v.prompt)}</div>
+      <div class="vs-grid">
+        ${revealCard('A', v.answerA, v.nameA, v.aVotes, v.flawless === 'a', v.aVotes >= v.bVotes)}
+        ${revealCard('B', v.answerB, v.nameB, v.bVotes, v.flawless === 'b', v.bVotes >= v.aVotes)}
+      </div>
+      ${v.isHost ? `<button class="full" data-act="bnext">Next ›</button>` : `<p class="hint center">Next up in a moment…</p>`}`;
+    return;
+  }
+  if (v.amAuthor) {
+    app.innerHTML = `${head}<div class="q-prompt center">${esc(v.prompt)}</div>
+      <div class="waitbox">🤫 One of these answers is yours — sit tight while everyone votes.<div class="muted" style="margin-top:8px">${v.voted}/${v.elig} voted</div></div>`;
+    return;
+  }
+  const choose = (k, txt) => `<button class="vote-card ${v.myVote === k ? 'picked' : ''}" data-act="bvote" data-choice="${k}">${esc(txt)}</button>`;
+  app.innerHTML = `${head}
+    <div class="q-prompt center">${esc(v.prompt)}</div>
+    <p class="hint center">Tap the funnier answer 👇</p>
+    <div class="vs-grid">${choose('a', v.answerA)}${choose('b', v.answerB)}</div>
+    ${v.myVote ? `<div class="done-badge">✓ Voted! (${v.voted}/${v.elig})</div>` : ''}`;
+}
+
+function renderBattleScores(v) {
+  const rows = v.board.map((p, i) =>
+    `<div class="score-row ${i === 0 ? 'lead' : ''}"><span class="rank">${i + 1}</span><span class="sname">${esc(p.name)}${p.you ? ' <span class="pill">you</span>' : ''}</span><span class="spts">${p.score}</span></div>`).join('');
+  if (v.final) {
+    const champ = v.board[0];
+    app.innerHTML = `
+      <div class="center"><div class="title">🏆</div><h2>${esc(champ ? champ.name : '')} wins!</h2><p class="sub">Final scores</p></div>
+      <div class="card">${rows}</div>
+      ${v.isHost ? `<button class="primary full" data-act="again">Back to lobby</button>` : `<p class="hint center">Waiting for the host…</p>`}`;
+    return;
+  }
+  app.innerHTML = `
+    <div class="center"><h2 style="margin-top:8px">Round ${v.round} — scores</h2></div>
+    <div class="card">${rows}</div>
+    ${v.isHost ? `<button class="primary full" data-act="bnext">${v.round >= v.rounds ? 'See the winner 🏆' : 'Next round ›'}</button>` : `<p class="hint center">Waiting for the host for the next round…</p>`}`;
+}
+
+// live countdown (updates text only, no re-render)
+setInterval(() => {
+  const el = document.getElementById('bcount');
+  if (!el) return;
+  if (ui.state && ui.state.deadline) {
+    const s = Math.max(0, Math.round((ui.state.deadline - Date.now()) / 1000));
+    el.textContent = '⏳ ' + s + 's';
+  } else el.textContent = '';
+}, 500);
+
 // ---------------------------------------------------------------- input
 document.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-act]'); if (!btn) return;
   const act = btn.dataset.act;
   if (act === 'create') {
     ui.name = document.getElementById('nameInput').value.trim() || 'Host';
-    localStorage.setItem('tc_name', ui.name); socket.emit('create', { name: ui.name, pid: PID });
+    localStorage.setItem('tc_name', ui.name);
+    socket.emit('create', { name: ui.name, pid: PID, game: btn.dataset.game || 'cooks' });
   } else if (act === 'join') {
     ui.name = document.getElementById('nameInput')?.value.trim() || ui.name || 'Cook';
     localStorage.setItem('tc_name', ui.name);
@@ -379,6 +497,10 @@ document.addEventListener('click', (e) => {
   else if (act === 'heat') { doAction({ kind: 'heat', level: btn.dataset.level }); }
   else if (act === 'serve') { doAction({ kind: 'serve' }); }
   else if (act === 'again') { socket.emit('playAgain'); }
+  else if (act === 'bstart') { socket.emit('bStart'); }
+  else if (act === 'banswer') { submitBattleAnswers(); }
+  else if (act === 'bvote') { socket.emit('bVote', { choice: btn.dataset.choice }); }
+  else if (act === 'bnext') { socket.emit('bNext'); }
   else if (act === 'toggleSpeak') {
     ui.speak = !ui.speak; localStorage.setItem('tc_speak', ui.speak ? '1' : '0'); render();
   }
